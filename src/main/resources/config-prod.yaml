@@ -1,0 +1,7 @@
+http:
+  port: "8082"
+db:
+  host: "mysql-31ca2ba6-ecommerce-real-time-order-processing-pipeline.j.aivencloud.com"
+  port: "15647"
+  user: "avnadmin"
+  name: "orderdb"

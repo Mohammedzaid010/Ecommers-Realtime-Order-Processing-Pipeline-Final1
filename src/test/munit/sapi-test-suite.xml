@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+  xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+  xmlns="http://www.mulesoft.org/schema/mule/core"
+  xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+  http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+  http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+  <munit:config name="sapi-test-suite.xml"/>
+
+  <munit:test name="sapi-insert-order-success" description="Header and items inserted, 201 returned">
+    <munit:behavior>
+      <munit-tools:mock-when processor="db:insert"/>
+      <munit-tools:mock-when processor="db:bulk-insert"/>
+      <set-payload value="#[readUrl('classpath://test-data/canonical-order.json', 'application/json')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="post:\orders:application\json:order-db-sapi-config"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('201')]"/>
+      <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('PERSISTED')]"/>
+      <munit-tools:verify-call processor="db:insert" times="1"/>
+      <munit-tools:verify-call processor="db:bulk-insert" times="1"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="sapi-update-status-unknown-order-raises-not-found" description="Zero rows updated: SAPI:NOT_FOUND" expectedErrorType="SAPI:NOT_FOUND">
+    <munit:behavior>
+      <munit-tools:mock-when processor="db:update">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{affectedRows: 0}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit:set-event>
+        <munit:payload value="#[{orderStatus: 'NOTIFIED', emailStatus: 'SENT'}]"/>
+        <munit:attributes value="#[{uriParams: {orderId: 'ORD-0000-1'}}]"/>
+      </munit:set-event>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="patch:\orders\(orderId):application\json:order-db-sapi-config"/>
+    </munit:execution>
+  </munit:test>
+
+  <munit:test name="sapi-update-status-success" description="Row updated: 200 body">
+    <munit:behavior>
+      <munit-tools:mock-when processor="db:update">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{affectedRows: 1}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit:set-event>
+        <munit:payload value="#[{orderStatus: 'NOTIFIED', emailStatus: 'SENT'}]"/>
+        <munit:attributes value="#[{uriParams: {orderId: 'ORD-2026-1001'}}]"/>
+      </munit:set-event>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="patch:\orders\(orderId):application\json:order-db-sapi-config"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.orderStatus]" is="#[MunitTools::equalTo('NOTIFIED')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="sapi-get-unknown-order-raises-not-found" description="Empty select: SAPI:NOT_FOUND" expectedErrorType="SAPI:NOT_FOUND">
+    <munit:behavior>
+      <munit-tools:mock-when processor="db:select">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[[]]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit:set-event>
+        <munit:attributes value="#[{uriParams: {orderId: 'ORD-0000-1'}}]"/>
+      </munit:set-event>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="get:\orders\(orderId):order-db-sapi-config"/>
+    </munit:execution>
+  </munit:test>
+</mule>

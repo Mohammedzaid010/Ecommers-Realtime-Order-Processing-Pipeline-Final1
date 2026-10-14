@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+  xmlns:db="http://www.mulesoft.org/schema/mule/db"
+  xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+  xmlns:http="http://www.mulesoft.org/schema/mule/http"
+  xmlns="http://www.mulesoft.org/schema/mule/core"
+  xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+  http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+  http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+  http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+  http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <flow name="order-db-sapi-main">
+    <http:listener config-ref="order-db-sapi-httpListenerConfig" path="/api/*" doc:name="HTTP listener">
+      <http:response statusCode="#[vars.httpStatus default 200]">
+        <http:headers>#[vars.outboundHeaders default {}]</http:headers>
+      </http:response>
+      <http:error-response statusCode="#[vars.httpStatus default 500]">
+        <http:body>#[payload]</http:body>
+        <http:headers>#[vars.outboundHeaders default {}]</http:headers>
+      </http:error-response>
+    </http:listener>
+    <apikit:router config-ref="order-db-sapi-config" doc:name="APIKit router"/>
+  </flow>
+
+  <!-- POST /orders : header + items in ONE local transaction -->
+  <flow name="post:\orders:application\json:order-db-sapi-config">
+    <set-variable variableName="correlationId" value="#[output application/java --- payload.correlationId default correlationId]" doc:name="Set correlationId"/>
+    <set-variable variableName="orderId" value="#[output application/java --- payload.orderId]" doc:name="Set orderId"/>
+    <logger level="INFO" category="com.hackathon.order.sapi" message="#[output text/plain --- '[$(vars.correlationId)] ENTER insert-order orderId=$(vars.orderId)']" doc:name="Log entry"/>
+    <ee:transform doc:name="Build DB parameters">
+      <ee:message/>
+      <ee:variables>
+        <ee:set-variable variableName="headerParams" resource="dwl/build-header-params.dwl"/>
+        <ee:set-variable variableName="itemParams" resource="dwl/build-item-params.dwl"/>
+      </ee:variables>
+    </ee:transform>
+    <try transactionalAction="ALWAYS_BEGIN" transactionType="LOCAL" doc:name="Transaction: header + items">
+      <db:insert config-ref="order-db-config" doc:name="Insert order header">
+        <db:sql>INSERT INTO orders (order_id, order_date, customer_id, customer_name, customer_email, customer_phone, address_line1, city, state, postal_code, country, payment_method, currency, total_amount, order_status, email_status, correlation_id, updated_at) VALUES (:orderId, :orderDate, :customerId, :customerName, :customerEmail, :customerPhone, :address, :city, :state, :postalCode, :country, :paymentMethod, :currency, :totalAmount, 'PERSISTED', 'PENDING', :correlationId, NOW())</db:sql>
+        <db:input-parameters>#[vars.headerParams]</db:input-parameters>
+      </db:insert>
+      <db:bulk-insert config-ref="order-db-config" doc:name="Insert order items">
+      <db:bulk-input-parameters>#[vars.itemParams]</db:bulk-input-parameters>
+      <db:sql>INSERT INTO order_items (order_id, product_id, product_name, quantity, unit_price, line_total) VALUES (:orderId, :productId, :productName, :quantity, :unitPrice, :lineTotal)</db:sql>
+      </db:bulk-insert>
+    </try>
+    <set-variable variableName="httpStatus" value="201" doc:name="Set 201"/>
+    <ee:transform doc:name="Build 201 body">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ orderId: vars.orderId, status: 'PERSISTED' }]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+    <logger level="INFO" category="com.hackathon.order.sapi" message="#[output text/plain --- '[$(vars.correlationId)] EXIT insert-order orderId=$(vars.orderId)']" doc:name="Log exit"/>
+  </flow>
+
+  <!-- PATCH /orders/{orderId} -->
+  <flow name="patch:\orders\(orderId):application\json:order-db-sapi-config">
+    <set-variable variableName="orderId" value="#[attributes.uriParams.orderId]" doc:name="Set orderId"/>
+    <set-variable variableName="update" value="#[payload]" doc:name="Keep update body"/>
+    <logger level="INFO" category="com.hackathon.order.sapi" message="#[output text/plain --- '[$(correlationId)] ENTER update-status orderId=$(vars.orderId)']" doc:name="Log entry"/>
+    <db:update config-ref="order-db-config" doc:name="Update statuses">
+      <db:sql>UPDATE orders SET order_status = :orderStatus, email_status = COALESCE(:emailStatus, email_status), updated_at = NOW() WHERE order_id = :orderId</db:sql>
+      <db:input-parameters>#[output application/java --- {orderStatus: vars.update.orderStatus, emailStatus: vars.update.emailStatus default null, orderId: vars.orderId}]</db:input-parameters>
+    </db:update>
+    <choice doc:name="Row found?">
+      <when expression="#[payload.affectedRows == 0]">
+        <raise-error type="SAPI:NOT_FOUND" description="Order not found"/>
+      </when>
+      <otherwise>
+        <ee:transform doc:name="Build 200 body">
+          <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ orderId: vars.orderId, orderStatus: vars.update.orderStatus, emailStatus: vars.update.emailStatus default null }]]></ee:set-payload>
+          </ee:message>
+        </ee:transform>
+      </otherwise>
+    </choice>
+  </flow>
+
+  <!-- GET /orders/{orderId} -->
+  <flow name="get:\orders\(orderId):order-db-sapi-config">
+    <set-variable variableName="orderId" value="#[attributes.uriParams.orderId]" doc:name="Set orderId"/>
+    <db:select config-ref="order-db-config" doc:name="Select header">
+      <db:sql>SELECT * FROM orders WHERE order_id = :orderId</db:sql>
+      <db:input-parameters>#[{orderId: vars.orderId}]</db:input-parameters>
+    </db:select>
+    <choice doc:name="Found?">
+      <when expression="#[isEmpty(payload)]">
+        <raise-error type="SAPI:NOT_FOUND" description="Order not found"/>
+      </when>
+      <otherwise>
+        <set-variable variableName="header" value="#[payload[0]]" doc:name="Keep header"/>
+        <db:select config-ref="order-db-config" doc:name="Select items">
+          <db:sql>SELECT * FROM order_items WHERE order_id = :orderId</db:sql>
+          <db:input-parameters>#[{orderId: vars.orderId}]</db:input-parameters>
+        </db:select>
+        <ee:transform doc:name="Build 200 body">
+          <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+vars.header ++ { items: payload }]]></ee:set-payload>
+          </ee:message>
+        </ee:transform>
+      </otherwise>
+    </choice>
+  </flow>
+</mule>

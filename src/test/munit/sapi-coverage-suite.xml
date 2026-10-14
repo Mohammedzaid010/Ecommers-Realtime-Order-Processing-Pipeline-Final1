@@ -1,0 +1,198 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+  xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+  xmlns="http://www.mulesoft.org/schema/mule/core"
+  xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+  http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+  http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+  <munit:config name="sapi-coverage-suite.xml"/>
+
+  <munit:test name="sapi-get-order-success" description="Existing order is returned with its items">
+    <munit:behavior>
+      <munit-tools:mock-when processor="db:select">
+        <munit-tools:with-attributes>
+          <munit-tools:with-attribute attributeName="doc:name" whereValue="Select header"/>
+        </munit-tools:with-attributes>
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[[{order_id: 'ORD-2026-1001', order_status: 'PERSISTED'}]]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit-tools:mock-when processor="db:select">
+        <munit-tools:with-attributes>
+          <munit-tools:with-attribute attributeName="doc:name" whereValue="Select items"/>
+        </munit-tools:with-attributes>
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[[{product_id: 'PROD-101', quantity: 2}]]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit:set-event>
+        <munit:attributes value="#[{uriParams: {orderId: 'ORD-2026-1001'}}]"/>
+      </munit:set-event>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="get:\orders\(orderId):order-db-sapi-config"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.order_status]" is="#[MunitTools::equalTo('PERSISTED')]"/>
+      <munit-tools:assert-that expression="#[sizeOf(payload.items)]" is="#[MunitTools::equalTo(1)]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="sapi-insert-database-down-returns-503" description="DB unreachable: 503 DATABASE_UNAVAILABLE">
+    <munit:behavior>
+      <munit-tools:mock-when processor="db:insert">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="DB:CONNECTIVITY"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <set-payload value="#[readUrl('classpath://test-data/canonical-order.json', 'application/json')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="post:\orders:application\json:order-db-sapi-config"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('503')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('DATABASE_UNAVAILABLE')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="sapi-insert-sql-failure-returns-400" description="Query error without a duplicate key: 400 PERSISTENCE_ERROR">
+    <munit:behavior>
+      <munit-tools:mock-when processor="db:insert">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="DB:QUERY_EXECUTION"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <set-payload value="#[readUrl('classpath://test-data/canonical-order.json', 'application/json')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="post:\orders:application\json:order-db-sapi-config"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('400')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('PERSISTENCE_ERROR')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="error-bad-request-returns-400" description="Router raises APIKIT:BAD_REQUEST: structured error with HTTP 400">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:BAD_REQUEST"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-db-sapi-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('400')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('VALIDATION_ERROR')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="error-not-found-returns-404" description="Router raises APIKIT:NOT_FOUND: structured error with HTTP 404">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:NOT_FOUND"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-db-sapi-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('404')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('NOT_FOUND')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="error-method-not-allowed-returns-405" description="Router raises APIKIT:METHOD_NOT_ALLOWED: structured error with HTTP 405">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:METHOD_NOT_ALLOWED"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-db-sapi-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('405')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('METHOD_NOT_ALLOWED')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="error-unsupported-media-returns-415" description="Router raises APIKIT:UNSUPPORTED_MEDIA_TYPE: structured error with HTTP 415">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:UNSUPPORTED_MEDIA_TYPE"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-db-sapi-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('415')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('UNSUPPORTED_MEDIA_TYPE')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="error-unexpected-returns-500" description="Router raises MULE:EXPRESSION: structured error with HTTP 500">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="MULE:EXPRESSION"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-db-sapi-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('500')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('INTERNAL_ERROR')]"/>
+    </munit:validation>
+  </munit:test>
+</mule>

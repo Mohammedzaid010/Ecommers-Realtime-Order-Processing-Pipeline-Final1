@@ -1,0 +1,89 @@
+#%RAML 1.0
+title: Order System API
+version: v1
+mediaType: application/json
+baseUri: http://localhost:8082/api
+
+types:
+  OrderItem:
+    properties:
+      productId: string
+      productName?: string
+      quantity: integer
+      unitPrice: number
+  CanonicalOrder:
+    properties:
+      orderId: string
+      orderDate: string
+      correlationId: string
+      customer:
+        properties:
+          customerId: string
+          name: string
+          email: string
+          phone?: string
+      shippingAddress:
+        properties:
+          addressLine1: string
+          city: string
+          state: string
+          postalCode: string
+          country: string
+      paymentMethod: string
+      currency: string
+      totalAmount: number
+      items: OrderItem[]
+  StatusUpdate:
+    properties:
+      orderStatus: string
+      emailStatus?: string
+  ErrorResponse:
+    properties:
+      status: string
+      code: string
+      message: string
+      correlationId: string
+      timestamp: string
+
+/orders:
+  post:
+    description: Insert order header and all items in ONE transaction
+    body:
+      application/json:
+        type: CanonicalOrder
+    responses:
+      201:
+        body:
+          application/json:
+            example: { "orderId": "ORD-2026-1001", "status": "PERSISTED" }
+      400:
+        body:
+          application/json:
+            type: ErrorResponse
+      409:
+        body:
+          application/json:
+            type: ErrorResponse
+      503:
+        body:
+          application/json:
+            type: ErrorResponse
+  /{orderId}:
+    get:
+      responses:
+        200:
+        404:
+          body:
+            application/json:
+              type: ErrorResponse
+    patch:
+      description: Update order status and email status
+      body:
+        application/json:
+          type: StatusUpdate
+      responses:
+        200:
+        404:
+          body:
+            application/json:
+              type: ErrorResponse

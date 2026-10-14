@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+  xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+  xmlns:db="http://www.mulesoft.org/schema/mule/db"
+  xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+  xmlns:http="http://www.mulesoft.org/schema/mule/http"
+  xmlns="http://www.mulesoft.org/schema/mule/core"
+  xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+  http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+  http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+  http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+  http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+  http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
+
+  <global-property name="env" value="dev"/>
+  <configuration-properties file="config-${env}.yaml" doc:name="Plain properties"/>
+  <secure-properties:config name="secure-props-config" file="config-secure-${env}.yaml" key="${mule.key}" doc:name="Secure properties">
+    <secure-properties:encrypt algorithm="AES" mode="CBC" useRandomIVs="true"/>
+  </secure-properties:config>
+
+  <http:listener-config name="order-db-sapi-httpListenerConfig" doc:name="HTTP listener config">
+    <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+  </http:listener-config>
+  <apikit:config name="order-db-sapi-config" api="api/order-db-sapi.raml" outboundHeadersMapName="outboundHeaders" httpStatusVarName="httpStatus" doc:name="APIKit config"/>
+  <db:config name="order-db-config" doc:name="MySQL database config">
+    <db:my-sql-connection host="${db.host}" port="${db.port}" user="${db.user}" password="${secure::db.password}" database="${db.name}"/>
+  </db:config>
+
+  <configuration defaultErrorHandler-ref="global-error-handler" doc:name="Configuration"/>
+
+  <sub-flow name="build-error-response-subflow">
+    <ee:transform doc:name="Build structured error body">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: 'ERROR',
+  code: vars.errorCode default 'INTERNAL_ERROR',
+  message: vars.errorMessage default 'Unexpected error. Quote the correlation ID to support.',
+  correlationId: vars.correlationId default correlationId,
+  timestamp: now()
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+  </sub-flow>
+
+  <error-handler name="global-error-handler">
+    <on-error-propagate type="APIKIT:BAD_REQUEST" doc:name="400 bad request">
+      <set-variable variableName="httpStatus" value="400"/>
+      <set-variable variableName="errorCode" value="VALIDATION_ERROR"/>
+      <set-variable variableName="errorMessage" value="#[error.description default 'Invalid request']"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="APIKIT:NOT_FOUND, SAPI:NOT_FOUND" doc:name="404 not found">
+      <set-variable variableName="httpStatus" value="404"/>
+      <set-variable variableName="errorCode" value="NOT_FOUND"/>
+      <set-variable variableName="errorMessage" value="Resource not found"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="APIKIT:METHOD_NOT_ALLOWED" doc:name="405">
+      <set-variable variableName="httpStatus" value="405"/>
+      <set-variable variableName="errorCode" value="METHOD_NOT_ALLOWED"/>
+      <set-variable variableName="errorMessage" value="Method not allowed"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="APIKIT:UNSUPPORTED_MEDIA_TYPE" doc:name="415">
+      <set-variable variableName="httpStatus" value="415"/>
+      <set-variable variableName="errorCode" value="UNSUPPORTED_MEDIA_TYPE"/>
+      <set-variable variableName="errorMessage" value="Unsupported media type"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="DB:CONNECTIVITY" doc:name="503 database unavailable">
+      <logger level="ERROR" category="com.hackathon.order.sapi" message="#[output text/plain --- '[$(vars.correlationId default correlationId)] Database connectivity failure']"/>
+      <set-variable variableName="httpStatus" value="503"/>
+      <set-variable variableName="errorCode" value="DATABASE_UNAVAILABLE"/>
+      <set-variable variableName="errorMessage" value="Database temporarily unavailable"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="DB:QUERY_EXECUTION" when="#[((error.description default '') ++ (error.detailedDescription default '')) contains 'Duplicate entry']" doc:name="409 duplicate key">
+      <logger level="ERROR" category="com.hackathon.order.sapi" message="#[output text/plain --- '[$(vars.correlationId default correlationId)] Duplicate order orderId=$(vars.orderId default 'n/a')']"/>
+      <set-variable variableName="httpStatus" value="409"/>
+      <set-variable variableName="errorCode" value="DUPLICATE_ORDER"/>
+      <set-variable variableName="errorMessage" value="Order already exists"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="DB:QUERY_EXECUTION, DB:BAD_SQL_SYNTAX" doc:name="400 persistence rejected">
+      <logger level="ERROR" category="com.hackathon.order.sapi" message="#[output text/plain --- '[$(vars.correlationId default correlationId)] Persistence failure orderId=$(vars.orderId default 'n/a') detail=$(error.description default 'n/a')']"/>
+      <set-variable variableName="httpStatus" value="400"/>
+      <set-variable variableName="errorCode" value="PERSISTENCE_ERROR"/>
+      <set-variable variableName="errorMessage" value="Order could not be stored"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="ANY" doc:name="500 unexpected">
+      <logger level="ERROR" category="com.hackathon.order.sapi" message="#[output text/plain --- '[$(vars.correlationId default correlationId)] Unexpected error: $(error.errorType.identifier default 'unknown')']"/>
+      <set-variable variableName="httpStatus" value="500"/>
+      <set-variable variableName="errorCode" value="INTERNAL_ERROR"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+  </error-handler>
+</mule>
