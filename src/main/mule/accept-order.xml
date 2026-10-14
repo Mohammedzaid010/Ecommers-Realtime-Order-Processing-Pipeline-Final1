@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+  xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+  xmlns:http="http://www.mulesoft.org/schema/mule/http"
+  xmlns:os="http://www.mulesoft.org/schema/mule/os"
+  xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+  xmlns="http://www.mulesoft.org/schema/mule/core"
+  xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+  http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+  http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+  http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+  http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+  http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd">
+
+  <flow name="accept-order-private-flow">
+    <set-variable variableName="correlationId" value="#[correlationId]" doc:name="Set correlationId"/>
+    <set-variable variableName="orderId" value="#[output application/java --- payload.orderId]" doc:name="Set orderId"/>
+    <logger level="INFO" category="com.hackathon.order.experience" message="#[output text/plain --- '[$(vars.correlationId)] ENTER accept-order orderId=$(vars.orderId)']" doc:name="Log entry"/>
+
+    <try doc:name="Check duplicate order">
+      <os:store key="#[vars.orderId]" failIfPresent="true" objectStore="orders-object-store" doc:name="Store orderId (idempotency)">
+        <os:value>#[vars.correlationId]</os:value>
+      </os:store>
+      <error-handler>
+        <on-error-propagate type="OS:KEY_ALREADY_EXISTS" doc:name="Already accepted">
+          <raise-error type="ORDER:DUPLICATE" description="Order already accepted"/>
+        </on-error-propagate>
+      </error-handler>
+    </try>
+
+    <try doc:name="Hand over to Process API">
+      <until-successful maxRetries="${process.retry.max}" millisBetweenRetries="${process.retry.delay}" doc:name="Retry call">
+        <http:request method="POST" config-ref="order-process-api-request-config" path="/api/orders" doc:name="POST /orders (Process API)">
+          <http:body>#[payload]</http:body>
+          <http:headers>#[{'X-Correlation-ID': vars.correlationId}]</http:headers>
+        </http:request>
+      </until-successful>
+      <error-handler>
+        <on-error-propagate doc:name="Process API failed">
+          <os:remove key="#[vars.orderId]" objectStore="orders-object-store" doc:name="Release idempotency key"/>
+          <logger level="ERROR" category="com.hackathon.order.experience" message="#[output text/plain --- '[$(vars.correlationId)] Process API call failed for orderId=$(vars.orderId)']"/>
+          <raise-error type="ORDER:QUEUE_UNAVAILABLE" description="Process API unavailable"/>
+        </on-error-propagate>
+      </error-handler>
+    </try>
+
+    <set-variable variableName="httpStatus" value="202" doc:name="Set 202"/>
+    <ee:transform doc:name="Build 202 response">
+      <ee:message>
+        <ee:set-payload resource="dwl/accepted-response.dwl"/>
+      </ee:message>
+    </ee:transform>
+    <logger level="INFO" category="com.hackathon.order.experience" message="#[output text/plain --- '[$(vars.correlationId)] EXIT accept-order orderId=$(vars.orderId) status=RECEIVED']" doc:name="Log exit"/>
+  </flow>
+</mule>

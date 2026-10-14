@@ -1,0 +1,73 @@
+#%RAML 1.0
+title: Order Experience API
+version: v1
+mediaType: application/json
+baseUri: http://localhost:8081/api
+
+types:
+  OrderRequest:
+    type: !include schemas/order-request.json
+    example: !include examples/order-request.json
+  OrderAccepted:
+    properties:
+      orderId: string
+      status: string
+      correlationId: string
+      message: string
+      receivedAt: string
+  FieldError:
+    properties:
+      field: string
+      message: string
+  ErrorResponse:
+    properties:
+      status: string
+      code: string
+      message: string
+      correlationId: string
+      timestamp: string
+      errors?: FieldError[]
+
+traits:
+  client-id-required:
+    headers:
+      client_id:
+        type: string
+        description: Client ID of the registered application
+      client_secret:
+        type: string
+        description: Client secret of the registered application
+
+/orders:
+  post:
+    description: Validate an order and accept it for asynchronous processing
+    is: [client-id-required]
+    headers:
+      X-Correlation-ID:
+        type: string
+        required: false
+    body:
+      application/json:
+        type: OrderRequest
+    responses:
+      202:
+        body:
+          application/json:
+            type: OrderAccepted
+            example: !include examples/order-accepted.json
+      400:
+        body:
+          application/json:
+            type: ErrorResponse
+      409:
+        body:
+          application/json:
+            type: ErrorResponse
+      500:
+        body:
+          application/json:
+            type: ErrorResponse
+      503:
+        body:
+          application/json:
+            type: ErrorResponse

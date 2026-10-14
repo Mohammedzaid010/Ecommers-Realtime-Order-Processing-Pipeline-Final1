@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+  xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+  xmlns="http://www.mulesoft.org/schema/mule/core"
+  xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+  http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+  http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+  <munit:config name="experience-test-suite.xml"/>
+
+  <munit:test name="accept-order-success-returns-received" description="Valid order: stored, handed to Process API, 202 RECEIVED">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:store"/>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{status: 'RECEIVED'}]"/>
+          <munit-tools:attributes value="#[{statusCode: 202}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <set-payload value="#[readUrl('classpath://test-data/order-valid.json', 'application/json')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="accept-order-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('RECEIVED')]"/>
+      <munit-tools:assert-that expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-2026-1001')]"/>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('202')]"/>
+      <munit-tools:verify-call processor="http:request" times="1"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="accept-order-duplicate-raises-order-duplicate" description="Second submission is rejected, Process API never called" expectedErrorType="ORDER:DUPLICATE">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:store">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="OS:KEY_ALREADY_EXISTS"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit-tools:mock-when processor="http:request"/>
+      <set-payload value="#[readUrl('classpath://test-data/order-valid.json', 'application/json')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="accept-order-private-flow"/>
+    </munit:execution>
+  </munit:test>
+
+  <munit:test name="accept-order-process-api-down-releases-key" description="Process API unreachable: 503 error and idempotency key released">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:store"/>
+      <munit-tools:mock-when processor="os:remove"/>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="HTTP:CONNECTIVITY"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <set-payload value="#[readUrl('classpath://test-data/order-valid.json', 'application/json')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="accept-order-private-flow"/>
+        <error-handler>
+          <on-error-continue type="ORDER:QUEUE_UNAVAILABLE"/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:verify-call processor="os:remove" times="1"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-api-post-orders-accepts" description="APIKit implementation flow for POST /orders returns 202">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:store"/>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{status: 'RECEIVED'}]"/>
+          <munit-tools:attributes value="#[{statusCode: 202}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <set-payload value="#[readUrl('classpath://test-data/order-valid.json', 'application/json')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="post:\orders:application\json:order-experience-api-config"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('RECEIVED')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="error-handler-invalid-request-returns-400" description="Router raises APIKIT:BAD_REQUEST: structured error with HTTP 400">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:BAD_REQUEST"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-experience-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('400')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('VALIDATION_ERROR')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-not-found-404" description="Router raises APIKIT:NOT_FOUND: structured error, HTTP 404">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:NOT_FOUND"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-experience-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('404')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('NOT_FOUND')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-method-not-allowed-405" description="Router raises APIKIT:METHOD_NOT_ALLOWED: structured error, HTTP 405">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:METHOD_NOT_ALLOWED"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-experience-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('405')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('METHOD_NOT_ALLOWED')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-not-acceptable-406" description="Router raises APIKIT:NOT_ACCEPTABLE: structured error, HTTP 406">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:NOT_ACCEPTABLE"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-experience-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('406')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('NOT_ACCEPTABLE')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-unsupported-media-415" description="Router raises APIKIT:UNSUPPORTED_MEDIA_TYPE: structured error, HTTP 415">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:UNSUPPORTED_MEDIA_TYPE"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-experience-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('415')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('UNSUPPORTED_MEDIA_TYPE')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-unexpected-500" description="Router raises MULE:EXPRESSION: structured error, HTTP 500">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="MULE:EXPRESSION"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-experience-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('500')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('INTERNAL_ERROR')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-409-mapped" description="Router raises ORDER:DUPLICATE: structured error, HTTP 409">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="ORDER:DUPLICATE"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-experience-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('409')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('DUPLICATE_ORDER')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-503-mapped" description="Router raises ORDER:QUEUE_UNAVAILABLE: structured error, HTTP 503">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="ORDER:QUEUE_UNAVAILABLE"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-experience-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('503')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('SERVICE_UNAVAILABLE')]"/>
+    </munit:validation>
+  </munit:test>
+
+</mule>

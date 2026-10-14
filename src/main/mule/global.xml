@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+  xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+  xmlns:http="http://www.mulesoft.org/schema/mule/http"
+  xmlns:os="http://www.mulesoft.org/schema/mule/os"
+  xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+  xmlns="http://www.mulesoft.org/schema/mule/core"
+  xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+  http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+  http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+  http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+  http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+  http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd">
+
+  <global-property name="env" value="dev"/>
+  <configuration-properties file="config-${env}.yaml" doc:name="Plain properties"/>
+
+  <http:listener-config name="order-experience-api-httpListenerConfig" doc:name="HTTP listener config">
+    <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+  </http:listener-config>
+  <apikit:config name="order-experience-api-config" api="api/order-experience-api.raml" outboundHeadersMapName="outboundHeaders" httpStatusVarName="httpStatus" doc:name="APIKit config"/>
+
+  <!-- Process API (layer below). Local: localhost:8083. CloudHub: set process.host / process.port / process.protocol. -->
+  <http:request-config name="order-process-api-request-config" responseTimeout="${process.timeout}" doc:name="Process API request config">
+    <http:request-connection protocol="${process.protocol}" host="${process.host}" port="${process.port}"/>
+  </http:request-config>
+
+  <!-- Idempotency store: the Experience API owns duplicate detection -->
+  <os:object-store name="orders-object-store" persistent="true" entryTtl="7" entryTtlUnit="DAYS" doc:name="Idempotency store"/>
+
+  <configuration defaultErrorHandler-ref="global-error-handler" doc:name="Configuration"/>
+
+  <sub-flow name="build-error-response-subflow">
+    <ee:transform doc:name="Build structured error body">
+      <ee:message>
+        <ee:set-payload resource="dwl/error-response.dwl"/>
+      </ee:message>
+    </ee:transform>
+    <logger level="DEBUG" category="com.hackathon.order.transform" message="#[output text/plain --- '[$(vars.correlationId default correlationId)] Error response built code=$(vars.errorCode default 'n/a') status=$(vars.httpStatus default 'n/a')']"/>
+  </sub-flow>
+
+  <error-handler name="global-error-handler">
+    <on-error-propagate type="APIKIT:BAD_REQUEST" doc:name="400 validation">
+      <logger level="WARN" category="com.hackathon.order.experience" message="#[output text/plain --- '[$(correlationId)] Validation failed']"/>
+      <ee:transform doc:name="Extract offending fields">
+        <ee:message/>
+        <ee:variables>
+          <ee:set-variable variableName="fieldErrors" resource="dwl/field-errors.dwl"/>
+        </ee:variables>
+      </ee:transform>
+      <set-variable variableName="httpStatus" value="400"/>
+      <set-variable variableName="errorCode" value="VALIDATION_ERROR"/>
+      <set-variable variableName="errorMessage" value="Invalid order request. See the errors array."/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="ORDER:DUPLICATE" doc:name="409 duplicate">
+      <logger level="WARN" category="com.hackathon.order.experience" message="#[output text/plain --- '[$(vars.correlationId default correlationId)] Duplicate order rejected orderId=$(vars.orderId default 'n/a')']"/>
+      <set-variable variableName="httpStatus" value="409"/>
+      <set-variable variableName="errorCode" value="DUPLICATE_ORDER"/>
+      <set-variable variableName="errorMessage" value="Order already accepted"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="ORDER:QUEUE_UNAVAILABLE" doc:name="503 queue unavailable">
+      <set-variable variableName="httpStatus" value="503"/>
+      <set-variable variableName="errorCode" value="SERVICE_UNAVAILABLE"/>
+      <set-variable variableName="errorMessage" value="Order could not be queued. Please retry."/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="APIKIT:NOT_FOUND" doc:name="404">
+      <set-variable variableName="httpStatus" value="404"/>
+      <set-variable variableName="errorCode" value="NOT_FOUND"/>
+      <set-variable variableName="errorMessage" value="Resource not found"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="APIKIT:METHOD_NOT_ALLOWED" doc:name="405">
+      <set-variable variableName="httpStatus" value="405"/>
+      <set-variable variableName="errorCode" value="METHOD_NOT_ALLOWED"/>
+      <set-variable variableName="errorMessage" value="Method not allowed"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="APIKIT:NOT_ACCEPTABLE" doc:name="406">
+      <set-variable variableName="httpStatus" value="406"/>
+      <set-variable variableName="errorCode" value="NOT_ACCEPTABLE"/>
+      <set-variable variableName="errorMessage" value="Not acceptable"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="APIKIT:UNSUPPORTED_MEDIA_TYPE" doc:name="415">
+      <set-variable variableName="httpStatus" value="415"/>
+      <set-variable variableName="errorCode" value="UNSUPPORTED_MEDIA_TYPE"/>
+      <set-variable variableName="errorMessage" value="Unsupported media type"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+    <on-error-propagate type="ANY" doc:name="500 unexpected">
+      <logger level="ERROR" category="com.hackathon.order.experience" message="#[output text/plain --- '[$(vars.correlationId default correlationId)] Unexpected error: $(error.errorType.identifier default 'unknown')']"/>
+      <set-variable variableName="httpStatus" value="500"/>
+      <set-variable variableName="errorCode" value="INTERNAL_ERROR"/>
+      <flow-ref name="build-error-response-subflow"/>
+    </on-error-propagate>
+  </error-handler>
+</mule>

@@ -1,0 +1,12 @@
+http:
+  port: "8081"
+api:
+  id: "0"
+process:
+  protocol: "HTTP"
+  host: "localhost"
+  port: "8083"
+  timeout: "5000"
+  retry:
+    max: "2"
+    delay: "200"
