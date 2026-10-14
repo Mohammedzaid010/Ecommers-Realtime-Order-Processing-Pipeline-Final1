@@ -1,0 +1,37 @@
+http:
+  port: "8081"
+api:
+  id: "0"
+order:
+  amount:
+    tolerance: "0.01"
+publish:
+  retry:
+    max: "2"
+    delay: "200"
+consumer:
+  threads: "2"
+  retry:
+    max: "3"
+    delay: "5000"
+email:
+  from: "orders@example.com"
+  retry:
+    max: "3"
+    delay: "2000"
+support:
+  email: "support@example.com"
+smtp:
+  host: "sandbox.smtp.mailtrap.io"
+  port: "2525"
+  user: "7ee42a7b8b3294"
+sapi:
+  protocol: "HTTPS"
+  host: "order-db-system-api-w78lxh.5sc6y6-2.usa-e2.cloudhub.io"
+  port: "443"
+  timeout: "5000"
+dlq:
+  alert:
+    threshold: "5"
+    frequency:
+      ms: "60000"

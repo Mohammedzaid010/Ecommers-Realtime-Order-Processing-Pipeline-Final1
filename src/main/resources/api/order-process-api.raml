@@ -1,0 +1,63 @@
+#%RAML 1.0
+title: Order Process API
+version: v1
+mediaType: application/json
+baseUri: http://localhost:8083/api
+
+types:
+  OrderRequest:
+    type: !include schemas/order-request.json
+  OrderAccepted:
+    properties:
+      orderId: string
+      status: string
+      correlationId: string
+      message: string
+      receivedAt: string
+  FieldError:
+    properties:
+      field: string
+      message: string
+  ErrorResponse:
+    properties:
+      status: string
+      code: string
+      message: string
+      correlationId: string
+      timestamp: string
+      errors?: FieldError[]
+
+/orders:
+  post:
+    description: Wrap a validated order in an event envelope and put it on the orders queue
+    headers:
+      X-Correlation-ID:
+        type: string
+        required: false
+    body:
+      application/json:
+        type: OrderRequest
+    responses:
+      202:
+        body:
+          application/json:
+            type: OrderAccepted
+      400:
+        body:
+          application/json:
+            type: ErrorResponse
+      500:
+        body:
+          application/json:
+            type: ErrorResponse
+      503:
+        body:
+          application/json:
+            type: ErrorResponse
+/admin/dlq:
+  get:
+    description: List the dead-letter messages
+    responses:
+      200:
+        body:
+          application/json:

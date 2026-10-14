@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+  xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+  xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+  xmlns:http="http://www.mulesoft.org/schema/mule/http"
+  xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+  xmlns:os="http://www.mulesoft.org/schema/mule/os"
+  xmlns:email="http://www.mulesoft.org/schema/mule/email"
+  xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+  xmlns="http://www.mulesoft.org/schema/mule/core"
+  xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+  http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+  http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+  http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+  http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+  http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+  http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd
+  http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd
+  http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
+
+
+  <flow name="order-process-api-main">
+    <http:listener config-ref="order-process-api-httpListenerConfig" path="/api/*" doc:name="HTTP listener">
+      <http:response statusCode="#[vars.httpStatus default 200]">
+        <http:headers>#[vars.outboundHeaders default {}]</http:headers>
+      </http:response>
+      <http:error-response statusCode="#[vars.httpStatus default 500]">
+        <http:body>#[payload]</http:body>
+        <http:headers>#[vars.outboundHeaders default {}]</http:headers>
+      </http:error-response>
+    </http:listener>
+    <apikit:router config-ref="order-process-api-config" doc:name="APIKit router"/>
+  </flow>
+
+  <flow name="post:\orders:application\json:order-process-api-config">
+    <flow-ref name="enqueue-order-private-flow" doc:name="Enqueue order"/>
+  </flow>
+
+  <flow name="get:\admin\dlq:order-process-api-config">
+    <flow-ref name="dlq-view-private-flow" doc:name="Dead-letter view"/>
+  </flow>
+
+  <!-- Wrap the validated order in an event envelope and put it on orders-queue; reply 202 -->
+  <flow name="enqueue-order-private-flow">
+    <set-variable variableName="correlationId" value="#[correlationId]" doc:name="Set correlationId"/>
+    <set-variable variableName="orderId" value="#[output application/java --- payload.orderId]" doc:name="Set orderId"/>
+    <logger level="INFO" category="com.hackathon.order.process" message="#[output text/plain --- '[$(vars.correlationId)] ENTER enqueue-order orderId=$(vars.orderId)']" doc:name="Log entry"/>
+    <ee:transform doc:name="Build order envelope">
+      <ee:message>
+        <ee:set-payload resource="dwl/build-order-envelope.dwl"/>
+      </ee:message>
+    </ee:transform>
+    <logger level="DEBUG" category="com.hackathon.order.transform" message="#[output text/plain --- '[$(vars.correlationId)] Envelope built, items=$(payload.payload.itemCount)']" doc:name="Log transform"/>
+    <try doc:name="Publish order">
+      <until-successful maxRetries="${publish.retry.max}" millisBetweenRetries="${publish.retry.delay}" doc:name="Retry publish">
+        <set-variable variableName="targetQueue" value="orders-queue" doc:name="Target queue"/>
+        <flow-ref name="#[vars.queuePublishFlow default 'queue-publish-private-flow']" doc:name="Publish to queue"/>
+      </until-successful>
+      <error-handler>
+        <on-error-propagate doc:name="Publish failed">
+          <logger level="ERROR" category="com.hackathon.order.process" message="#[output text/plain --- '[$(vars.correlationId)] Publish failed for orderId=$(vars.orderId)']"/>
+          <raise-error type="ORDER:QUEUE_UNAVAILABLE" description="Queue unavailable"/>
+        </on-error-propagate>
+      </error-handler>
+    </try>
+    <set-variable variableName="httpStatus" value="202" doc:name="Set 202"/>
+    <ee:transform doc:name="Build 202 response">
+      <ee:message>
+        <ee:set-payload resource="dwl/accepted-response.dwl"/>
+      </ee:message>
+    </ee:transform>
+    <logger level="INFO" category="com.hackathon.order.process" message="#[output text/plain --- '[$(vars.correlationId)] EXIT enqueue-order orderId=$(vars.orderId) status=RECEIVED']" doc:name="Log exit"/>
+  </flow>
+</mule>

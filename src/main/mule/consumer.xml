@@ -1,0 +1,317 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+  xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+  xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+  xmlns:http="http://www.mulesoft.org/schema/mule/http"
+  xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+  xmlns:os="http://www.mulesoft.org/schema/mule/os"
+  xmlns:email="http://www.mulesoft.org/schema/mule/email"
+  xmlns:api-gateway="http://www.mulesoft.org/schema/mule/api-gateway"
+  xmlns="http://www.mulesoft.org/schema/mule/core"
+  xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+  http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+  http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+  http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+  http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+  http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+  http://www.mulesoft.org/schema/mule/email http://www.mulesoft.org/schema/mule/email/current/mule-email.xsd
+  http://www.mulesoft.org/schema/mule/api-gateway http://www.mulesoft.org/schema/mule/api-gateway/current/mule-api-gateway.xsd
+  http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
+
+  <!-- ================= Asynchronous consumer ================= -->
+  <flow name="order-consumer-flow">
+    <vm:listener queueName="orders-queue" config-ref="vm-config" numberOfConsumers="${consumer.threads}" doc:name="Consume orders-queue"/>
+    <flow-ref name="order-consumer-processing-private-flow" doc:name="Process order message"/>
+  </flow>
+
+  <flow name="order-consumer-processing-private-flow">
+    <set-variable variableName="rawMessage" value="#[payload]" doc:name="Keep raw message"/>
+    <set-variable variableName="correlationId" value="UNKNOWN" doc:name="Default correlationId"/>
+    <set-variable variableName="orderId" value="UNKNOWN" doc:name="Default orderId"/>
+    <ee:transform doc:name="Parse envelope">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+read(payload, 'application/json')]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+    <set-variable variableName="envelope" value="#[payload]" doc:name="Keep envelope"/>
+    <set-variable variableName="correlationId" value="#[output application/java --- payload.correlationId default 'UNKNOWN']" doc:name="Set correlationId"/>
+    <set-variable variableName="orderId" value="#[output application/java --- payload.payload.orderId default 'UNKNOWN']" doc:name="Set orderId"/>
+    <logger level="INFO" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] ENTER consume orderId=$(vars.orderId) retryCount=$(vars.envelope.retryCount default 0)']" doc:name="Log entry"/>
+
+    <ee:transform doc:name="Validate envelope">
+      <ee:message/>
+      <ee:variables>
+        <ee:set-variable variableName="envelopeCheck" resource="dwl/validate-envelope.dwl"/>
+      </ee:variables>
+    </ee:transform>
+    <choice doc:name="Envelope valid?">
+      <when expression="#[not vars.envelopeCheck.valid]">
+        <raise-error type="ORDER:INVALID_MESSAGE" description="#[output text/plain --- 'Invalid queue message: ' ++ (vars.envelopeCheck.errors joinBy '; ')]"/>
+      </when>
+    </choice>
+
+    <ee:transform doc:name="Transform to canonical order">
+      <ee:message>
+        <ee:set-payload resource="dwl/to-canonical-order.dwl"/>
+      </ee:message>
+    </ee:transform>
+    <set-variable variableName="canonical" value="#[payload]" doc:name="Keep canonical order"/>
+    <logger level="DEBUG" category="com.hackathon.order.transform" message="#[output text/plain --- '[$(vars.correlationId)] Canonical order built, items=$(sizeOf(vars.canonical.items))']" doc:name="Log transform"/>
+
+    <ee:transform doc:name="Verify order total">
+      <ee:message/>
+      <ee:variables>
+        <ee:set-variable variableName="amountCheck" resource="dwl/check-amount.dwl"/>
+      </ee:variables>
+    </ee:transform>
+    <choice doc:name="Total within tolerance?">
+      <when expression="#[not vars.amountCheck.withinTolerance]">
+        <raise-error type="ORDER:AMOUNT_MISMATCH" description="Submitted total does not match recalculated line items"/>
+      </when>
+    </choice>
+
+    <flow-ref name="persist-order-subflow" doc:name="Persist order"/>
+    <flow-ref name="send-confirmation-subflow" doc:name="Send confirmation"/>
+    <logger level="INFO" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] EXIT consume orderId=$(vars.orderId)']" doc:name="Log exit"/>
+
+    <error-handler>
+      <on-error-continue type="ORDER:INVALID_MESSAGE, MULE:EXPRESSION" doc:name="Invalid or corrupted message">
+        <set-variable variableName="dlqReason" value="INVALID_MESSAGE"/>
+        <set-variable variableName="errorDetail" value="#[error.description default 'n/a']"/>
+        <logger level="ERROR" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] Invalid queue message orderId=$(vars.orderId): $(vars.errorDetail)']"/>
+        <flow-ref name="publish-to-dlq-subflow"/>
+      </on-error-continue>
+      <on-error-continue type="ORDER:AMOUNT_MISMATCH" doc:name="Total mismatch">
+        <set-variable variableName="dlqReason" value="AMOUNT_MISMATCH"/>
+        <set-variable variableName="errorDetail" value="#[output text/plain --- 'calculated=$(vars.amountCheck.calculatedTotal) submitted=$(vars.amountCheck.submittedTotal)']"/>
+        <logger level="ERROR" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] Amount mismatch orderId=$(vars.orderId) $(vars.errorDetail)']"/>
+        <flow-ref name="publish-to-dlq-subflow"/>
+        <flow-ref name="notify-support-subflow"/>
+      </on-error-continue>
+      <on-error-continue type="ORDER:ALREADY_PERSISTED" doc:name="Already persisted">
+        <logger level="WARN" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] Order already persisted, skipping orderId=$(vars.orderId)']"/>
+      </on-error-continue>
+      <on-error-continue type="ORDER:PERSISTENCE_REJECTED" doc:name="Persistence rejected">
+        <set-variable variableName="dlqReason" value="PERSISTENCE_REJECTED"/>
+        <set-variable variableName="errorDetail" value="#[error.description default 'n/a']"/>
+        <logger level="ERROR" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] Persistence rejected orderId=$(vars.orderId): $(vars.errorDetail)']"/>
+        <flow-ref name="publish-to-dlq-subflow"/>
+      </on-error-continue>
+      <on-error-continue doc:name="System error: retry then DLQ">
+        <set-variable variableName="errorDetail" value="#[error.description default 'n/a']"/>
+        <logger level="ERROR" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] System error orderId=$(vars.orderId): $(vars.errorDetail)']"/>
+        <flow-ref name="retry-or-dlq-subflow"/>
+      </on-error-continue>
+    </error-handler>
+  </flow>
+
+
+  <!-- Single place that talks to the queue. Swap this flow to move from VM to Anypoint MQ or JMS. -->
+  <flow name="queue-publish-private-flow">
+    <vm:publish queueName="#[vars.targetQueue]" config-ref="vm-config" doc:name="Publish to queue">
+      <vm:content>#[write(payload, 'application/json')]</vm:content>
+    </vm:publish>
+  </flow>
+
+  <sub-flow name="persist-order-subflow">
+    <http:request method="POST" config-ref="order-db-sapi-request-config" path="/api/orders" doc:name="POST /orders (System API)">
+      <http:body>#[output application/json --- vars.canonical]</http:body>
+      <http:headers>#[{'X-Correlation-ID': vars.correlationId}]</http:headers>
+      <http:response-validator>
+        <http:success-status-code-validator values="0..599"/>
+      </http:response-validator>
+    </http:request>
+    <choice doc:name="Check System API status">
+      <when expression="#[(attributes.statusCode default 201) == 409]">
+        <raise-error type="ORDER:ALREADY_PERSISTED" description="Order already persisted"/>
+      </when>
+      <when expression="#[(attributes.statusCode default 201) == 400 or (attributes.statusCode default 201) == 422]">
+        <raise-error type="ORDER:PERSISTENCE_REJECTED" description="System API rejected the order"/>
+      </when>
+      <when expression="#[(attributes.statusCode default 201) >= 300]">
+        <raise-error type="ORDER:SYSTEM_ERROR" description="#[output text/plain --- 'System API returned status ' ++ (attributes.statusCode default 0)]"/>
+      </when>
+    </choice>
+    <logger level="INFO" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] Order persisted orderId=$(vars.orderId)']"/>
+  </sub-flow>
+
+  <sub-flow name="send-confirmation-subflow">
+    <ee:transform doc:name="Build email body">
+      <ee:message/>
+      <ee:variables>
+        <ee:set-variable variableName="emailBody" resource="dwl/confirmation-email.dwl"/>
+      </ee:variables>
+    </ee:transform>
+    <set-variable variableName="emailSent" value="#[false]" doc:name="emailSent = false"/>
+    <try doc:name="Send confirmation email">
+      <until-successful maxRetries="${email.retry.max}" millisBetweenRetries="${email.retry.delay}" doc:name="Retry email">
+        <email:send config-ref="smtp-config" fromAddress="${email.from}" subject="#[output text/plain --- 'Order Confirmation - $(vars.orderId)']" doc:name="Send email">
+          <email:to-addresses>
+            <email:to-address value="#[vars.canonical.customer.email]"/>
+          </email:to-addresses>
+          <email:body contentType="text/plain" encoding="UTF-8">
+            <email:content>#[vars.emailBody]</email:content>
+          </email:body>
+        </email:send>
+      </until-successful>
+      <set-variable variableName="emailSent" value="#[true]" doc:name="emailSent = true"/>
+      <error-handler>
+        <on-error-continue doc:name="Email failed">
+          <logger level="ERROR" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] Email failed orderId=$(vars.orderId): $(error.description default 'n/a')']"/>
+        </on-error-continue>
+      </error-handler>
+    </try>
+    <choice doc:name="Email sent?">
+      <when expression="#[vars.emailSent]">
+        <http:request method="PATCH" config-ref="order-db-sapi-request-config" path="/api/orders/{orderId}" doc:name="PATCH NOTIFIED">
+          <http:body>#[output application/json --- {orderStatus: 'NOTIFIED', emailStatus: 'SENT'}]</http:body>
+          <http:headers>#[{'X-Correlation-ID': vars.correlationId}]</http:headers>
+          <http:uri-params>#[{orderId: vars.orderId}]</http:uri-params>
+        </http:request>
+        <logger level="INFO" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] Order NOTIFIED orderId=$(vars.orderId)']"/>
+      </when>
+      <otherwise>
+        <http:request method="PATCH" config-ref="order-db-sapi-request-config" path="/api/orders/{orderId}" doc:name="PATCH PENDING_RETRY">
+          <http:body>#[output application/json --- {orderStatus: 'PERSISTED', emailStatus: 'PENDING_RETRY'}]</http:body>
+          <http:headers>#[{'X-Correlation-ID': vars.correlationId}]</http:headers>
+          <http:uri-params>#[{orderId: vars.orderId}]</http:uri-params>
+        </http:request>
+        <logger level="WARN" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] Email PENDING_RETRY orderId=$(vars.orderId)']"/>
+      </otherwise>
+    </choice>
+  </sub-flow>
+
+  <sub-flow name="retry-or-dlq-subflow">
+    <choice doc:name="Retries left?">
+      <when expression="#[(vars.envelope.retryCount default 0) &lt; (p('consumer.retry.max') as Number)]">
+        <logger level="WARN" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] Re-queueing orderId=$(vars.orderId) attempt=$((vars.envelope.retryCount default 0) + 1)']"/>
+        <ee:transform doc:name="Increment retryCount">
+          <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+vars.envelope ++ { retryCount: (vars.envelope.retryCount default 0) + 1 }]]></ee:set-payload>
+          </ee:message>
+        </ee:transform>
+        <set-variable variableName="targetQueue" value="orders-queue" doc:name="Target queue"/>
+        <flow-ref name="#[vars.queuePublishFlow default 'queue-publish-private-flow']" doc:name="Publish to queue"/>
+      </when>
+      <otherwise>
+        <set-variable variableName="dlqReason" value="RETRIES_EXHAUSTED"/>
+        <flow-ref name="publish-to-dlq-subflow"/>
+      </otherwise>
+    </choice>
+  </sub-flow>
+
+  <sub-flow name="publish-to-dlq-subflow">
+    <ee:transform doc:name="Build DLQ message">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  reason: vars.dlqReason,
+  correlationId: vars.correlationId default 'UNKNOWN',
+  orderId: vars.orderId default 'UNKNOWN',
+  failedAt: now(),
+  errorDetail: vars.errorDetail default '',
+  originalMessage: vars.rawMessage as String
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+    <set-variable variableName="targetQueue" value="orders-dlq" doc:name="Target queue"/>
+        <flow-ref name="#[vars.queuePublishFlow default 'queue-publish-private-flow']" doc:name="Publish to queue"/>
+    <logger level="ERROR" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] Sent to DLQ orderId=$(vars.orderId) reason=$(vars.dlqReason)']"/>
+  </sub-flow>
+
+  <sub-flow name="notify-support-subflow">
+    <try doc:name="Notify support">
+      <email:send config-ref="smtp-config" fromAddress="${email.from}" subject="#[output text/plain --- '[ALERT] Order total mismatch - $(vars.orderId)']" doc:name="Send exception email">
+        <email:to-addresses>
+          <email:to-address value="${support.email}"/>
+        </email:to-addresses>
+        <email:body contentType="text/plain" encoding="UTF-8">
+          <email:content>#[output text/plain --- 'Order $(vars.orderId) (correlationId $(vars.correlationId)) was quarantined. $(vars.errorDetail)']</email:content>
+        </email:body>
+      </email:send>
+      <error-handler>
+        <on-error-continue>
+          <logger level="ERROR" category="com.hackathon.order.consumer" message="#[output text/plain --- '[$(vars.correlationId)] Support notification failed']"/>
+        </on-error-continue>
+      </error-handler>
+    </try>
+  </sub-flow>
+
+  <!-- ================= Dead-letter handling ================= -->
+  <flow name="dlq-monitor-flow">
+    <vm:listener queueName="orders-dlq" config-ref="vm-config" doc:name="Consume orders-dlq"/>
+    <flow-ref name="dlq-monitor-processing-private-flow" doc:name="Store dead letter"/>
+  </flow>
+
+  <flow name="dlq-monitor-processing-private-flow">
+    <logger level="ERROR" category="com.hackathon.order.dlq" message="#[output text/plain --- 'Dead-letter message received: $(payload)']"/>
+    <os:store key="#[uuid()]" objectStore="dlq-object-store" doc:name="Keep dead letter">
+      <os:value>#[payload as String]</os:value>
+    </os:store>
+  </flow>
+
+  <flow name="dlq-view-private-flow">
+    <os:retrieve-all objectStore="dlq-object-store" doc:name="Read dead letters"/>
+    <ee:transform doc:name="Build DLQ view">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun parse(s) = do {
+  var first = read(s as String, "application/json") default s
+  ---
+  if (first is String) (read(first, "application/json") default first) else first
+}
+fun fixOriginal(dl) = dl mapObject ((v, k) ->
+  if (k as String == "originalMessage" and v is String)
+    { (k): (read(v, "application/json") default v) }
+  else
+    { (k): v }
+)
+---
+{
+  depth: sizeOf(payload),
+  messages: payload pluck ((value) -> fixOriginal(parse(value)))
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+  <flow name="dlq-alert-flow">
+    <scheduler doc:name="Every minute">
+      <scheduling-strategy>
+        <fixed-frequency frequency="${dlq.alert.frequency.ms}"/>
+      </scheduling-strategy>
+    </scheduler>
+    <os:retrieve-all objectStore="dlq-object-store" doc:name="Read dead letters"/>
+    <choice doc:name="Depth over threshold?">
+      <when expression="#[sizeOf(payload) &gt;= (p('dlq.alert.threshold') as Number)]">
+        <logger level="ERROR" category="com.hackathon.order.dlq" message="#[output text/plain --- 'ALERT: dead-letter depth is $(sizeOf(payload)) (threshold $(p(&quot;dlq.alert.threshold&quot;)))']"/>
+        <try>
+          <email:send config-ref="smtp-config" fromAddress="${email.from}" subject="[ALERT] Dead-letter queue depth" doc:name="Email alert">
+            <email:to-addresses>
+              <email:to-address value="${support.email}"/>
+            </email:to-addresses>
+            <email:body contentType="text/plain" encoding="UTF-8">
+              <email:content>#[output text/plain --- 'Dead-letter depth is $(sizeOf(payload)). Check GET /admin/dlq.']</email:content>
+            </email:body>
+          </email:send>
+          <error-handler>
+            <on-error-continue>
+              <logger level="ERROR" category="com.hackathon.order.dlq" message="DLQ alert email failed"/>
+            </on-error-continue>
+          </error-handler>
+        </try>
+      </when>
+    </choice>
+  </flow>
+</mule>

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Configuration>
+  <Appenders>
+    <Console name="console">
+      <PatternLayout pattern="%-5p %d [%t] [correlationId=%X{correlationId}] %c: %m%n"/>
+    </Console>
+  </Appenders>
+  <Loggers>
+    <AsyncLogger name="org.mule.service.http" level="WARN"/>
+    <AsyncLogger name="org.mule.extension.http" level="WARN"/>
+    <AsyncLogger name="com.hackathon.order" level="DEBUG"/>
+    <AsyncRoot level="INFO">
+      <AppenderRef ref="console"/>
+    </AsyncRoot>
+  </Loggers>
+</Configuration>

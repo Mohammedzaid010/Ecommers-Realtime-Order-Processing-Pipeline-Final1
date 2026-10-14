@@ -1,0 +1,377 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+  xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+  xmlns="http://www.mulesoft.org/schema/mule/core"
+  xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+  http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+  http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+  <munit:config name="process-coverage-suite.xml"/>
+
+  <flow name="coverage-publish-stub-flow">
+    <set-variable variableName="publishLog" value="#[output application/java --- (vars.publishLog default []) ++ [vars.targetQueue]]"/>
+  </flow>
+
+  <flow name="coverage-publish-failing-stub-flow">
+    <raise-error type="TEST:PUBLISH_FAILED" description="Simulated queue failure"/>
+  </flow>
+
+  <munit:test name="enqueue-order-success-returns-202" description="Order wrapped in an envelope, published to orders-queue, 202 RECEIVED">
+    <munit:behavior>
+      <set-variable variableName="queuePublishFlow" value="coverage-publish-stub-flow"/>
+      <choice><when expression="#[false]"><flow-ref name="coverage-publish-stub-flow"/></when></choice>
+      <set-payload value="#[readUrl('classpath://test-data/order-valid.json', 'application/json')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="enqueue-order-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('RECEIVED')]"/>
+      <munit-tools:assert-that expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-2026-1001')]"/>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('202')]"/>
+      <munit-tools:assert-that expression="#[vars.publishLog[0]]" is="#[MunitTools::equalTo('orders-queue')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="enqueue-order-publish-failure-raises-503" description="Queue failure surfaces as ORDER:QUEUE_UNAVAILABLE" expectedErrorType="ORDER:QUEUE_UNAVAILABLE">
+    <munit:behavior>
+      <set-variable variableName="queuePublishFlow" value="coverage-publish-failing-stub-flow"/>
+      <choice><when expression="#[false]"><flow-ref name="coverage-publish-failing-stub-flow"/></when></choice>
+      <set-payload value="#[readUrl('classpath://test-data/order-valid.json', 'application/json')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="enqueue-order-private-flow"/>
+    </munit:execution>
+  </munit:test>
+
+  <munit:test name="coverage-api-post-orders-accepts" description="APIKit implementation flow for POST /orders returns 202">
+    <munit:behavior>
+      <set-variable variableName="queuePublishFlow" value="coverage-publish-stub-flow"/>
+      <choice><when expression="#[false]"><flow-ref name="coverage-publish-stub-flow"/></when></choice>
+      <set-payload value="#[readUrl('classpath://test-data/order-valid.json', 'application/json')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="post:\orders:application\json:order-process-api-config"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('RECEIVED')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-api-get-dlq-delegates" description="APIKit implementation flow for GET /admin/dlq returns the dead-letter view">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:retrieve-all">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="get:\admin\dlq:order-process-api-config"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.depth]" is="#[MunitTools::equalTo(0)]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-dlq-view-parses-messages" description="Stored dead letters come back as real JSON objects">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:retrieve-all">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{a: '{&quot;reason&quot;:&quot;AMOUNT_MISMATCH&quot;,&quot;orderId&quot;:&quot;ORD-1&quot;,&quot;originalMessage&quot;:&quot;{\&quot;x\&quot;:1}&quot;}'}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="dlq-view-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.depth]" is="#[MunitTools::equalTo(1)]"/>
+      <munit-tools:assert-that expression="#[payload.messages[0].reason]" is="#[MunitTools::equalTo('AMOUNT_MISMATCH')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-not-found-404" description="Router raises APIKIT:NOT_FOUND: structured error, HTTP 404">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:NOT_FOUND"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-process-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('404')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('NOT_FOUND')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-method-not-allowed-405" description="Router raises APIKIT:METHOD_NOT_ALLOWED: structured error, HTTP 405">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:METHOD_NOT_ALLOWED"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-process-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('405')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('METHOD_NOT_ALLOWED')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-not-acceptable-406" description="Router raises APIKIT:NOT_ACCEPTABLE: structured error, HTTP 406">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:NOT_ACCEPTABLE"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-process-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('406')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('NOT_ACCEPTABLE')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-unsupported-media-415" description="Router raises APIKIT:UNSUPPORTED_MEDIA_TYPE: structured error, HTTP 415">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:UNSUPPORTED_MEDIA_TYPE"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-process-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('415')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('UNSUPPORTED_MEDIA_TYPE')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-unexpected-500" description="Router raises MULE:EXPRESSION: structured error, HTTP 500">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="MULE:EXPRESSION"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-process-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('500')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('INTERNAL_ERROR')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-400-mapped" description="Router raises APIKIT:BAD_REQUEST: structured error, HTTP 400">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="APIKIT:BAD_REQUEST"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-process-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('400')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('VALIDATION_ERROR')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-error-503-mapped" description="Router raises ORDER:QUEUE_UNAVAILABLE: structured error, HTTP 503">
+    <munit:behavior>
+      <munit-tools:mock-when processor="apikit:router">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="ORDER:QUEUE_UNAVAILABLE"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <try>
+        <flow-ref name="order-process-api-main"/>
+        <error-handler>
+          <on-error-continue/>
+        </error-handler>
+      </try>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo('503')]"/>
+      <munit-tools:assert-that expression="#[payload.code]" is="#[MunitTools::equalTo('SERVICE_UNAVAILABLE')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-consumer-persistence-rejected-goes-to-dlq" description="System API 400: DLQ with PERSISTENCE_REJECTED">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+          <munit-tools:attributes value="#[{statusCode: 400}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <set-variable variableName="queuePublishFlow" value="coverage-publish-stub-flow"/>
+      <choice><when expression="#[false]"><flow-ref name="coverage-publish-stub-flow"/></when></choice>
+      <set-payload value="#[readUrl('classpath://test-data/envelope-valid.json', 'text/plain')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="order-consumer-processing-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.dlqReason]" is="#[MunitTools::equalTo('PERSISTENCE_REJECTED')]"/>
+      <munit-tools:assert-that expression="#[vars.publishLog[0]]" is="#[MunitTools::equalTo('orders-dlq')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-consumer-system-api-500-requeues" description="System API 500: re-queued for another attempt">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+          <munit-tools:attributes value="#[{statusCode: 500}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <set-variable variableName="queuePublishFlow" value="coverage-publish-stub-flow"/>
+      <choice><when expression="#[false]"><flow-ref name="coverage-publish-stub-flow"/></when></choice>
+      <set-payload value="#[readUrl('classpath://test-data/envelope-valid.json', 'text/plain')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="order-consumer-processing-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.publishLog[0]]" is="#[MunitTools::equalTo('orders-queue')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-notify-support-email-failure-is-contained" description="Support email failing does not break the flow">
+    <munit:behavior>
+      <munit-tools:mock-when processor="email:send">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="EMAIL:CONNECTIVITY"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <set-variable variableName="orderId" value="ORD-1"/>
+      <set-variable variableName="correlationId" value="corr-1"/>
+      <set-variable variableName="errorDetail" value="detail"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="notify-support-subflow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:verify-call processor="email:send" times="1"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-dlq-monitor-stores-dead-letter" description="A dead letter is stored for inspection">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:store"/>
+      <set-payload value="#['{&quot;reason&quot;:&quot;INVALID_MESSAGE&quot;}']"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="dlq-monitor-processing-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:verify-call processor="os:store" times="1"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-dlq-alert-below-threshold-sends-nothing" description="Few dead letters: no alert email">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:retrieve-all">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{a: 'one'}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit-tools:mock-when processor="email:send"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="dlq-alert-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:verify-call processor="email:send" times="0"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-dlq-alert-above-threshold-sends-email" description="Many dead letters: alert email sent">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:retrieve-all">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{a: 1, b: 2, c: 3, d: 4, e: 5, f: 6}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit-tools:mock-when processor="email:send"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="dlq-alert-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:verify-call processor="email:send" times="1"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="coverage-dlq-alert-email-failure-is-contained" description="Alert email failing does not break the flow">
+    <munit:behavior>
+      <munit-tools:mock-when processor="os:retrieve-all">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{a: 1, b: 2, c: 3, d: 4, e: 5, f: 6}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit-tools:mock-when processor="email:send">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="EMAIL:CONNECTIVITY"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="dlq-alert-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:verify-call processor="email:send" times="1"/>
+    </munit:validation>
+  </munit:test>
+
+</mule>

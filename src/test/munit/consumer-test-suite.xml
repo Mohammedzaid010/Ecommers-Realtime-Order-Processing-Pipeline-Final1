@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+  xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+  xmlns="http://www.mulesoft.org/schema/mule/core"
+  xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+  http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+  http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+  <munit:config name="consumer-test-suite.xml"/>
+
+  <flow name="consumer-publish-stub-flow">
+    <set-variable variableName="publishLog" value="#[output application/java --- (vars.publishLog default []) ++ [vars.targetQueue]]"/>
+  </flow>
+
+
+  <munit:test name="consumer-happy-path-persists-and-emails" description="Valid message: persisted, email sent, NOTIFIED">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+          <munit-tools:attributes value="#[{statusCode: 201}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit-tools:mock-when processor="email:send"/>
+      <set-payload value="#[readUrl('classpath://test-data/envelope-valid.json', 'text/plain')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="order-consumer-processing-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:verify-call processor="http:request" times="2"/>
+      <munit-tools:verify-call processor="email:send" times="1"/>
+      <munit-tools:assert-that expression="#[vars.emailSent]" is="#[MunitTools::equalTo(true)]"/>
+      <munit-tools:assert-that expression="#[output application/java --- (vars.emailBody contains '{{')]" is="#[MunitTools::equalTo(false)]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="consumer-corrupt-message-goes-to-dlq" description="Unreadable message: DLQ, nothing persisted or emailed">
+    <munit:behavior>
+      <set-variable variableName="queuePublishFlow" value="consumer-publish-stub-flow"/>
+      <choice><when expression="#[false]"><flow-ref name="consumer-publish-stub-flow"/></when></choice>
+      <munit-tools:mock-when processor="http:request"/>
+      <munit-tools:mock-when processor="email:send"/>
+      <set-payload value="#[readUrl('classpath://test-data/envelope-corrupt.txt', 'text/plain')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="order-consumer-processing-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.dlqReason]" is="#[MunitTools::equalTo('INVALID_MESSAGE')]"/>
+      <munit-tools:assert-that expression="#[sizeOf(vars.publishLog default [])]" is="#[MunitTools::equalTo(1)]"/>
+      <munit-tools:assert-that expression="#[vars.publishLog[0]]" is="#[MunitTools::equalTo('orders-dlq')]"/>
+      <munit-tools:verify-call processor="http:request" times="0"/>
+      <munit-tools:verify-call processor="email:send" times="0"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="consumer-schema-invalid-message-goes-to-dlq" description="Envelope missing required fields: DLQ">
+    <munit:behavior>
+      <set-variable variableName="queuePublishFlow" value="consumer-publish-stub-flow"/>
+      <choice><when expression="#[false]"><flow-ref name="consumer-publish-stub-flow"/></when></choice>
+      <munit-tools:mock-when processor="http:request"/>
+      <set-payload value="#[readUrl('classpath://test-data/envelope-invalid.json', 'text/plain')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="order-consumer-processing-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.dlqReason]" is="#[MunitTools::equalTo('INVALID_MESSAGE')]"/>
+      <munit-tools:verify-call processor="http:request" times="0"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="consumer-amount-mismatch-is-quarantined" description="Total mismatch: DLQ + support notice, never persisted">
+    <munit:behavior>
+      <set-variable variableName="queuePublishFlow" value="consumer-publish-stub-flow"/>
+      <choice><when expression="#[false]"><flow-ref name="consumer-publish-stub-flow"/></when></choice>
+      <munit-tools:mock-when processor="http:request"/>
+      <munit-tools:mock-when processor="email:send"/>
+      <set-payload value="#[readUrl('classpath://test-data/envelope-mismatch.json', 'text/plain')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="order-consumer-processing-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.dlqReason]" is="#[MunitTools::equalTo('AMOUNT_MISMATCH')]"/>
+      <munit-tools:verify-call processor="http:request" times="0"/>
+      <munit-tools:assert-that expression="#[sizeOf(vars.publishLog default [])]" is="#[MunitTools::equalTo(1)]"/>
+      <munit-tools:assert-that expression="#[vars.publishLog[0]]" is="#[MunitTools::equalTo('orders-dlq')]"/>
+      <munit-tools:verify-call processor="email:send" times="1"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="consumer-email-failure-keeps-order-pending-retry" description="SMTP down: order stays PERSISTED, PATCH PENDING_RETRY">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+          <munit-tools:attributes value="#[{statusCode: 201}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit-tools:mock-when processor="email:send">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="EMAIL:CONNECTIVITY"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <set-payload value="#[readUrl('classpath://test-data/envelope-valid.json', 'text/plain')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="order-consumer-processing-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.emailSent]" is="#[MunitTools::equalTo(false)]"/>
+      <munit-tools:verify-call processor="http:request" times="2"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="consumer-database-down-requeues-message" description="System API unavailable: re-queued with retryCount+1, no email">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="HTTP:CONNECTIVITY"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <set-variable variableName="queuePublishFlow" value="consumer-publish-stub-flow"/>
+      <choice><when expression="#[false]"><flow-ref name="consumer-publish-stub-flow"/></when></choice>
+      <munit-tools:mock-when processor="email:send"/>
+      <set-payload value="#[readUrl('classpath://test-data/envelope-valid.json', 'text/plain')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="order-consumer-processing-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[sizeOf(vars.publishLog default [])]" is="#[MunitTools::equalTo(1)]"/>
+      <munit-tools:assert-that expression="#[vars.publishLog[0]]" is="#[MunitTools::equalTo('orders-queue')]"/>
+      <munit-tools:verify-call processor="email:send" times="0"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="consumer-retries-exhausted-goes-to-dlq" description="retryCount at the limit: DLQ instead of re-queue">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="HTTP:CONNECTIVITY"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <set-variable variableName="queuePublishFlow" value="consumer-publish-stub-flow"/>
+      <choice><when expression="#[false]"><flow-ref name="consumer-publish-stub-flow"/></when></choice>
+      <set-payload value="#[readUrl('classpath://test-data/envelope-valid.json', 'text/plain') replace '&quot;retryCount&quot;:0' with '&quot;retryCount&quot;:3']"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="order-consumer-processing-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[vars.dlqReason]" is="#[MunitTools::equalTo('RETRIES_EXHAUSTED')]"/>
+      <munit-tools:assert-that expression="#[vars.publishLog[0]]" is="#[MunitTools::equalTo('orders-dlq')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="consumer-already-persisted-skips-email" description="SAPI 409: no second email">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+          <munit-tools:attributes value="#[{statusCode: 409}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit-tools:mock-when processor="email:send"/>
+      <set-payload value="#[readUrl('classpath://test-data/envelope-valid.json', 'text/plain')]"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="order-consumer-processing-private-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:verify-call processor="email:send" times="0"/>
+    </munit:validation>
+  </munit:test>
+</mule>
